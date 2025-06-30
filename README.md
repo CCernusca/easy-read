@@ -2,6 +2,9 @@
 
 EasyRead is a tool made with Python which automatically detects text on screens and highlights relevant keywords to enhance the casual reading experience. It is made for the [BWKI Österreich](https://bwki.asai.ac.at/) competition.
 
+![WIP image of the tool](images/wip_300625.png)
+*In-Development image of a prototype showing word & paragraph detection as well as primitive keyword extraction*
+
 ## Workflow
 
 1. A screenshot is taken using **mss**.
