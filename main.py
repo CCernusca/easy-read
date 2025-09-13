@@ -9,26 +9,40 @@ from PIL import Image, ImageFilter
 from PyQt6.QtWidgets import QApplication, QWidget
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QImage
-from transformers import pipeline
+from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Windows
 # pytesseract.pytesseract.tesseract_cmd = '/usr/local/bin/tesseract'  # macOS
 # pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'  # Linux
 
 class KeywordDetector:
-    def __init__(self):
+    def __init__(self, model_path="./models/flan-t5-small"):
+        # Load tokenizer from local directory
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        
+        # Load model from local directory
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto" if torch.cuda.is_available() else None
+        )
+        
+        # Create pipeline with local model and tokenizer
         self.keyword_pipe = pipeline(
             "text2text-generation",
-            model="google/flan-t5-small",
+            model=model,
+            tokenizer=tokenizer,
             device=0 if torch.cuda.is_available() else -1,
             torch_dtype=torch.float16
         )
-        self.prompt = """Extract 1-3 most important keywords from the text. 
-        Keywords should be: nouns, verbs, or named entities. 
-        Output as comma-separated list.
+
+        self.prompt = """
+        You are a expert linguist, with decades of experience in extracting key information and keywords from text. 
+        Extract the 1-3 most important keywords from the following text. Keywords should be: nouns, verbs, or named entities. 
+        Output the keywords in the language of the original text as a space-separated list.
         
-        Text: "{text}"
-        Keywords:"""
+        "{text}"
+        """
     
     def extract_keywords(self, text, max_length=50):
         """Keyword extraction"""
@@ -43,8 +57,12 @@ class KeywordDetector:
             early_stopping=True
         )
         
-        keywords = [kw.strip() for kw in results[0]['generated_text'].split(",")]
-        return keywords[:3]
+        # Clean up keywords
+        keywords = [kw.strip(" .,_´`-")  for kw in results[0]['generated_text'].split()]
+        # Basic plural is added manually, as the model seems to struggle with it
+        for keyword in keywords.copy():
+            keywords.append(f"{keyword}s")
+        return keywords
 
 def find_keyword_positions(paragraph_text, keywords):
     """Locate keywords within paragraph text"""
@@ -84,7 +102,6 @@ class TextOverlay(QWidget):
         self.keyword_detector = KeywordDetector()
         
         # Text detection state
-        self.words = []
         self.paragraphs = []
         
         # Performance tracking
@@ -109,6 +126,9 @@ class TextOverlay(QWidget):
 
         # Word detection confidence threshold
         self.confidence_threshold = 0
+
+        # Minimum word count for a paragraph to be considered meaningful
+        self.text_paragraph_word_count = 10
         
     def capture_screen(self):
         """Capture screen region using MSS"""
@@ -145,7 +165,6 @@ class TextOverlay(QWidget):
         ocr_time = time.time() - start_time
         
         # Save words of text & Group text into paragraphs
-        self.words.clear()
         paragraphs = {}
         for i in range(len(data['text'])):
             conf = int(float(data['conf'][i]))
@@ -154,26 +173,26 @@ class TextOverlay(QWidget):
             # If confidence is high enough and text is just a random character or empty
             if conf > self.confidence_threshold and len(text.strip()) > 1:
                 # Word saving
-                self.words.append({list(data.keys())[j]: v[i] for j, v in enumerate(data.values())})
+                word = {list(data.keys())[j]: v[i] for j, v in enumerate(data.values())}
                 # Apply correction factor to position data (OCR error as well as scaling down)
-                self.words[-1]["left"] = int(self.words[-1]["left"] * 0.8 / self.scaling_factor)
-                self.words[-1]["top"] = int(self.words[-1]["top"] * 0.8 / self.scaling_factor)
-                self.words[-1]["width"] = int(self.words[-1]["width"] * 0.8 / self.scaling_factor)
-                self.words[-1]["height"] = int(self.words[-1]["height"] * 0.8 / self.scaling_factor)
+                word["left"] = int(word["left"] * 0.8 / self.scaling_factor)
+                word["top"] = int(word["top"] * 0.8 / self.scaling_factor)
+                word["width"] = int(word["width"] * 0.8 / self.scaling_factor)
+                word["height"] = int(word["height"] * 0.8 / self.scaling_factor)
                 
                 # Paragraph grouping
                 if level == 5:  # Word level
-                    block = self.words[-1]['block_num']
-                    para = self.words[-1]['par_num']
+                    block = word['block_num']
+                    para = word['par_num']
                     key = (block, para)
                     
                     if key not in paragraphs:
-                        paragraphs[key] = {'text': [], 'bboxes': []}
+                        paragraphs[key] = {'text': [], 'bboxes': [], 'words': []}
                     
-                    x, y, w, h = self.words[-1]['left'], self.words[-1]['top'], self.words[-1]['width'], self.words[-1]['height']
+                    x, y, w, h = word['left'], word['top'], word['width'], word['height']
                     paragraphs[key]['bboxes'].append((x, y, w, h))
                     paragraphs[key]['text'].append(text)
-        print(self.words)
+                    paragraphs[key]['words'].append(word)
         
         # Paragraph processing
         processed_paragraphs = []
@@ -187,24 +206,22 @@ class TextOverlay(QWidget):
             full_text = ' '.join(para['text'])
             processed_paragraphs.append({
                 'word_count': len(para['text']),
+                'words': para['words'],
                 'text': full_text,
                 'position': (x_min, y_min, x_max - x_min, y_max - y_min),
                 'keywords': [],
-                'keyword_positions': []
+                'text_paragraph': len(para['text']) > self.text_paragraph_word_count  # Whether the paragraph is meaningful
             })
         
         # Keyword detection
         keyword_start = time.time()
         for para in processed_paragraphs:
-            if para['word_count'] > 10:  # Only process meaningful paragraphs
+            if para['text_paragraph']:  # Only process meaningful paragraphs
                 try:
                     keywords = self.keyword_detector.extract_keywords(para['text'])
                     para['keywords'] = keywords
-                    para['keyword_positions'] = find_keyword_positions(para['text'], keywords)
                 except Exception as e:
-                    print(f"Keyword extraction failed: {e}")
-                    para['keywords'] = []
-                    para['keyword_positions'] = []
+                    raise Exception(f"Keyword extraction failed: {e}")
         llm_time = time.time() - keyword_start
 
         return processed_paragraphs, ocr_time, llm_time
@@ -227,7 +244,7 @@ class TextOverlay(QWidget):
             
             self.update()
         except Exception as e:
-            print(f"Detection error: {e}")
+            raise Exception(f"Detection error: {e}")
             self.last_process_time = time.time() - update_start
 
     def paintEvent(self, event):
@@ -236,38 +253,58 @@ class TextOverlay(QWidget):
 
         painter.setFont(self.paragraph_font)
 
-        # Draw words
-        for word in self.words:
-            x, y, w, h = word['left'], word['top'], word['width'], word['height']
+        # Save words to underline
+        highlights = []
 
-            # Draw word bounding box
-            painter.setPen(QColor(255, 80, 80, 100))
-            painter.drawRect(x, y, w, h)
-
-            # Draw text label
-            text = word['text'][:50] + "..." if len(word['text']) > 50 else word['text']
-            painter.drawText(x, y - 5, text)
-
-            # Draw confidence
-            painter.setPen(QColor(0, 200, 0, 90))
-            painter.drawText(x + w - 10, y - 5, f"{word['conf']}%")
-        
-        # Draw paragraphs
+        # Draw paragraphs, their keywords and words:
         for para in self.paragraphs:
-            x, y, w, h = para['position']
-            
-            # Draw paragraph bounding box
-            painter.setPen(QColor(80, 80, 255, 220))
-            painter.drawRect(x, y, w, h)
+            px, py, pw, ph = para['position']
+
+            # Draw words
+            for word in para['words']:
+                wx, wy, ww, wh = word['left'], word['top'], word['width'], word['height']
+
+                # Draw word bounding box, color is based on if it is a keyword
+                if word['text'] in para['keywords']:
+                    painter.setPen(QColor(255, 0, 0, 100))  # Keywords are red
+                    painter.drawRect(wx, wy, ww, wh)
+
+                    # Draw text label
+                    text = word['text'][:50] + "..." if len(word['text']) > 50 else word['text']
+                    painter.drawText(wx, wy - 5, text)
+
+                    # Draw confidence
+                    painter.drawText(wx + ww - 10, wy - 5, f"{word['conf']}%")
+
+                    # Save word to underline
+                    highlights.append((wx, wy, ww, wh))
+
+                elif not word['text'] in para['keywords']:
+                    painter.setPen(QColor(0, 0, 255, 100))  # Other words are blue
+                    painter.drawRect(wx, wy, ww, wh)
+
+                    # Draw text label
+                    text = word['text'][:50] + "..." if len(word['text']) > 50 else word['text']
+                    painter.drawText(wx, wy - 5, text)
+
+                    # Draw confidence
+                    painter.drawText(wx + ww - 10, wy - 5, f"{word['conf']}%")
+
+            # Draw paragraph bounding box, color is based on if it is a meaningful paragraph
+            if para['text_paragraph']:
+                painter.setPen(QColor(0, 255, 0, 220))  # Meaningful paragraphs are green
+            else:
+                painter.setPen(QColor(0, 100, 0, 220))  # Meaningless paragraphs are dark green
+            painter.drawRect(px, py, pw, ph)
             
             # Draw text label
-            print(para)
             text = ", ".join(para['keywords'])
-            painter.drawText(x, y - 15, text)
-            
-            # # Draw keywords if available
-            # if 'keyword_positions' in para:
-            #     self.draw_keywords(painter, para, x, y + h + 5)
+            painter.drawText(px, py - 10, text)
+        
+        # Underline highlighted words
+        for highlight in highlights:
+            painter.setPen(QColor(255, 0, 0, 255))
+            painter.drawLine(highlight[0] - highlight[2] // 10, highlight[1] + highlight[3], highlight[0] + highlight[2] + highlight[2] // 10, highlight[1] + highlight[3])
         
         # Draw performance stats last (so it stays on top)
         self.draw_performance_stats(painter)
